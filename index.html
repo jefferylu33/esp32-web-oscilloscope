@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>機車電瓶 Web Bluetooth 示波器</title>
+  <style>
+    body {
+      background-color: #121212;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .panel {
+      width: 100%;
+      max-width: 800px;
+      background: #1e1e1e;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      box-sizing: border-box;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .status {
+      font-size: 14px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: #333;
+    }
+    .status.connected { background: #005f33; color: #00ff88; }
+    .voltage-display {
+      font-size: 32px;
+      font-weight: bold;
+      color: #00ffcc;
+      margin: 8px 0;
+    }
+    canvas {
+      width: 100%;
+      height: 320px;
+      background: #000;
+      border-radius: 8px;
+      border: 1px solid #333;
+      display: block;
+    }
+    .controls {
+      margin-top: 16px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    button {
+      flex: 1;
+      padding: 12px;
+      font-size: 16px;
+      font-weight: bold;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #007bff;
+      color: #fff;
+    }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    button.disconnect { background: #dc3545; }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <div class="header">
+      <h2>機車電瓶即時示波器</h2>
+      <div id="bleStatus" class="status">藍芽未連接</div>
+    </div>
+
+    <div class="voltage-display">
+      <span id="currentVoltage">--.--</span> <span style="font-size:18px; color:#aaa;">V</span>
+    </div>
+
+    <canvas id="scopeCanvas" width="800" height="320"></canvas>
+
+    <div class="controls">
+      <button id="btnConnect">連接 ESP32 藍芽</button>
+      <button id="btnDisconnect" class="disconnect" disabled>斷開連接</button>
+    </div>
+  </div>
+
+  <script>
+    // 與 ESP32 韌體對應的 UUID
+    const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+    const CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+    const DIVIDER_RATIO = 6.0; // 分壓比 (100k + 20k) / 20k
+
+    let bleDevice = null;
+    let bleCharacteristic = null;
+
+    // 示波器波形緩衝區 (保存 500 點歷史數據)
+    const BUFFER_SIZE = 500;
+    const waveBuffer = new Float32Array(BUFFER_SIZE).fill(0);
+    let latestVoltage = 0.0;
+
+    const canvas = document.getElementById('scopeCanvas');
+    const ctx = canvas.getContext('2d');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnDisconnect = document.getElementById('btnDisconnect');
+    const statusLabel = document.getElementById('bleStatus');
+    const voltDisplay = document.getElementById('currentVoltage');
+
+    // -------------------------------------------------------------
+    // 1. Web Bluetooth 連線邏輯
+    // -------------------------------------------------------------
+    btnConnect.addEventListener('click', async () => {
+      try {
+        statusLabel.textContent = "搜尋裝置中...";
+        // 請求藍芽裝置 (必須由手勢觸發)
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'ESP32_Oscilloscope' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        statusLabel.textContent = "連線 GATT 伺服器...";
+        const server = await bleDevice.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        bleCharacteristic = await service.getCharacteristic(CHAR_UUID);
+
+        // 啟動 Notification 接收原始封包
+        await bleCharacteristic.startNotifications();
+        bleCharacteristic.addEventListener('characteristicvaluechanged', handleDataPacket);
+
+        statusLabel.textContent = "藍芽已連線";
+        statusLabel.className = "status connected";
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+
+      } catch (error) {
+        console.error("連線失敗:", error);
+        statusLabel.textContent = "連線失敗";
+        alert("連線失敗: " + error.message);
+      }
+    });
+
+    btnDisconnect.addEventListener('click', () => {
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+      }
+    });
+
+    function onDisconnected() {
+      statusLabel.textContent = "藍芽已斷線";
+      statusLabel.className = "status";
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+    }
+
+    // -------------------------------------------------------------
+    // 2. 高效二進位封包解析 (Binary Payload Parser)
+    // -------------------------------------------------------------
+    function handleDataPacket(event) {
+      const dataView = event.target.value;
+      if (dataView.byteLength < 6) return;
+
+      // 檢查 Header 是否為 0x55AA
+      const header = dataView.getUint16(0, true);
+      if (header !== 0x55AA) return;
+
+      const sampleCount = dataView.getUint16(4, true);
+
+      // 一次解析封包內的採樣點
+      for (let i = 0; i < sampleCount; i++) {
+        const rawMv = dataView.getUint16(6 + (i * 2), true);
+        const volt = (rawMv / 1000.0) * DIVIDER_RATIO;
+
+        // 推入循環緩衝區
+        shiftAndPushBuffer(volt);
+        latestVoltage = volt;
+      }
+
+      // 同步檢查：如果有外網且發生發動異常 (如電壓急降 < 9.5V)，上傳雲端
+      if (latestVoltage > 0.5 && latestVoltage < 9.5) {
+        syncWarningToCloud({ event: "CRANKING_VOLTAGE_DROP", voltage: latestVoltage });
+      }
+    }
+
+    function shiftAndPushBuffer(val) {
+      waveBuffer.copyWithin(0, 1);
+      waveBuffer[BUFFER_SIZE - 1] = val;
+    }
+
+    // -------------------------------------------------------------
+    // 3. 高效 Canvas 示波器繪圖 (60 FPS RequestAnimationFrame)
+    // -------------------------------------------------------------
+    function renderScope() {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // 繪製背景網格
+      ctx.strokeStyle = '#222';
+      ctx.lineWidth = 1;
+      for (let y = 0; y <= h; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      // 繪製 12V 標記線
+      const y12v = h - (12.0 / 18.0) * h;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, y12v);
+      ctx.lineTo(w, y12v);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 繪製電壓波形 (量程: 0V ~ 18V)
+      ctx.strokeStyle = '#00ffcc';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+
+      for (let i = 0; i < BUFFER_SIZE; i++) {
+        const x = (i / (BUFFER_SIZE - 1)) * w;
+        // 電壓換算成 Canvas Y 座標
+        const volt = waveBuffer[i];
+        const y = h - (volt / 18.0) * h;
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // 更新數字看板
+      voltDisplay.textContent = latestVoltage.toFixed(2);
+
+      requestAnimationFrame(renderScope);
+    }
+    requestAnimationFrame(renderScope);
+
+    // -------------------------------------------------------------
+    // 4. 外網同步範例 (走手機 4G/5G，不影響藍芽)
+    // -------------------------------------------------------------
+    let lastUploadTime = 0;
+    function syncWarningToCloud(payload) {
+      const now = Date.now();
+      if (now - lastUploadTime < 3000) return; // 節流：3秒內不重複觸發
+      lastUploadTime = now;
+
+      /* 替換為你的雲端 API 接口
+      fetch('https://api.yourdomain.com/v1/log-battery', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, timestamp: now })
+      }).catch(err => console.error("雲端上傳失敗:", err));
+      */
+    }
+  </script>
+</body>
+</html>
